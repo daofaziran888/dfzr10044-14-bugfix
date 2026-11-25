@@ -22,9 +22,18 @@ class IngestBatchService(BaseModuleService):
 
     def ingest_batch(self, lake_table: str, source_system: str,
                      rows: list[dict[str, Any]], window_start: str,
-                     window_end: str) -> dict[str, Any]:
-        """接收入湖批次数据：去重、存储、并与快照绑定。"""
-        batch_id = f"batch-{lake_table}-{uuid.uuid4().hex[:6]}"
+                     window_end: str, batch_id: str | None = None,
+                     idempotency_key: str | None = None) -> dict[str, Any]:
+        """接收入湖批次数据：去重、存储、并与快照绑定。
+
+        显式传入 batch_id 时按 (lake_table, batch_id) 幂等；调度器重放原批不会
+        因随机生成新批次而绕过对账。
+        """
+        requested_batch_id = batch_id or idempotency_key
+        replay_existing = None
+        if requested_batch_id:
+            replay_existing = lake_store.get_batch(requested_batch_id, lake_table)
+
         # 先去重再存储
         seen = set()
         deduped: list[dict[str, Any]] = []
@@ -33,10 +42,46 @@ class IngestBatchService(BaseModuleService):
             if key not in seen:
                 seen.add(key)
                 deduped.append(r)
+
+        if replay_existing is not None:
+            replay_checksum = hashlib.md5(
+                str(sorted([str(r) for r in deduped])).encode()
+            ).hexdigest()
+            same_payload = replay_existing.checksum == replay_checksum
+            if same_payload:
+                lake_store.update_batch_status(
+                    requested_batch_id, "ingesting", lake_table=lake_table
+                )
+                return {
+                    "ok": True,
+                    "success": True,
+                    "replayed": True,
+                    "idempotent_replay": True,
+                    "batch_id": requested_batch_id,
+                    "lake_table": lake_table,
+                    "row_count": len(deduped),
+                    "duplicates_removed": len(rows) - len(deduped),
+                    "checksum": replay_existing.checksum,
+                    "window": f"{window_start} ~ {window_end}",
+                }
+            return {
+                "ok": False,
+                "success": False,
+                "http_status": 409,
+                "error_code": "batch_payload_conflict",
+                "error": "同湖表同编号批次已存在，但重放内容不一致",
+                "batch_id": requested_batch_id,
+                "lake_table": lake_table,
+            }
+
+        batch_id = requested_batch_id or f"batch-{lake_table}-{uuid.uuid4().hex[:6]}"
         br = lake_store.store_batch(batch_id, lake_table, source_system,
                                     deduped, window_start, window_end)
-        lake_store.update_batch_status(batch_id, "ingesting")
+        lake_store.update_batch_status(batch_id, "ingesting", lake_table=lake_table)
         return {
+            "ok": True,
+            "success": True,
+            "replayed": False,
             "batch_id": batch_id,
             "lake_table": lake_table,
             "row_count": len(deduped),

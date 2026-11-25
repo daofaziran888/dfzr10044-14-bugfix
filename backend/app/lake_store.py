@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import threading
 import time
 import uuid
@@ -136,11 +137,27 @@ class LakeStore:
         # 水位：lake_table -> WatermarkRecord
         self._watermarks: dict[str, WatermarkRecord] = {}
 
-        # 批次数据：batch_id -> BatchRecord
+        # 批次数据：逻辑键为 (lake_table, batch_id)，实际存储键带湖表命名空间，
+        # 避免不同湖表复用同一个批次编号时互相覆盖。
         self._batches: dict[str, BatchRecord] = {}
+        self._batch_scope_index: dict[tuple[str, str], str] = {}
+        self._batch_id_aliases: dict[str, set[str]] = {}
 
-        # 隔离区：batch_id -> list[dict]（被拦截的数据行）
+        # 隔离区：batch_id -> list[dict]（被拦截的数据行，原始记录保留以便回查）
         self._quarantine: dict[str, list[dict[str, Any]]] = {}
+
+        # 入湖后的可查询数据：lake_table -> lake_row_id -> row
+        self._lake_rows: dict[str, dict[str, dict[str, Any]]] = {}
+
+        # 质量检查结果与更正/回执的幂等索引
+        self._quality_checks: dict[str, dict[str, Any]] = {}
+        self._quality_check_by_batch: dict[tuple[str, str], str] = {}
+        self._corrections: dict[str, dict[str, Any]] = {}
+        self._correction_by_key: dict[str, str] = {}
+        self._receipts: dict[str, dict[str, Any]] = {}
+
+        # 交接状态的进程内锁；接口重试和调度器重放依赖它保证不产生重复行。
+        self._handoff_lock = threading.RLock()
 
         # 写锁
         self._write_lock = WriteLock()
@@ -298,6 +315,10 @@ class LakeStore:
 
     # ---- 批次数据 ----
 
+    @staticmethod
+    def _batch_scope_key(lake_table: str, batch_id: str) -> str:
+        return f"{lake_table}\x1f{batch_id}"
+
     def store_batch(
         self, batch_id: str, lake_table: str, source_system: str,
         rows: list[dict[str, Any]], window_start: str, window_end: str,
@@ -305,6 +326,7 @@ class LakeStore:
         checksum = hashlib.md5(
             str(sorted([str(r) for r in rows])).encode()
         ).hexdigest()
+        scope_key = self._batch_scope_key(lake_table, batch_id)
         br = BatchRecord(
             batch_id=batch_id,
             lake_table=lake_table,
@@ -318,17 +340,38 @@ class LakeStore:
             status="pending",
             created_at=time.time(),
         )
-        self._batches[batch_id] = br
+        self._batches[scope_key] = br
+        self._batch_scope_index[(lake_table, batch_id)] = scope_key
+        self._batch_id_aliases.setdefault(batch_id, set()).add(scope_key)
         return br
 
-    def get_batch(self, batch_id: str) -> BatchRecord | None:
-        return self._batches.get(batch_id)
+    def get_batch(
+        self, batch_id: str, lake_table: str | None = None
+    ) -> BatchRecord | None:
+        if lake_table is not None:
+            scope_key = self._batch_scope_index.get((lake_table, batch_id))
+            if scope_key is not None:
+                return self._batches.get(scope_key)
+            # 兼容历史调用：批次编号由系统生成且全局唯一时可直接命中。
+            return self._batches.get(batch_id)
+
+        direct = self._batches.get(batch_id)
+        if direct is not None:
+            return direct
+        aliases = sorted(self._batch_id_aliases.get(batch_id, set()))
+        if not aliases:
+            return None
+        # 不带湖表的旧接口只能在编号唯一时无歧义；重号时由调用方传 lake_table。
+        return self._batches.get(aliases[-1])
 
     def list_batches(self, lake_table: str) -> list[BatchRecord]:
         return [b for b in self._batches.values() if b.lake_table == lake_table]
 
-    def update_batch_status(self, batch_id: str, status: str, snapshot_id: str | None = None) -> BatchRecord | None:
-        br = self._batches.get(batch_id)
+    def update_batch_status(
+        self, batch_id: str, status: str, snapshot_id: str | None = None,
+        lake_table: str | None = None,
+    ) -> BatchRecord | None:
+        br = self.get_batch(batch_id, lake_table)
         if br is None:
             return None
         br.status = status
@@ -336,38 +379,263 @@ class LakeStore:
             br.snapshot_id = snapshot_id
         return br
 
+    # ---- 入湖查询行 ----
+
+    def upsert_lake_row(
+        self,
+        lake_table: str,
+        row_id: str,
+        row: dict[str, Any],
+        *,
+        source_batch_id: str | None = None,
+        source_row_id: str | None = None,
+        receipt_id: str | None = None,
+        commit_status: str = "confirmed",
+    ) -> dict[str, Any]:
+        """按确定性 row_id 幂等写入入湖查询结果。"""
+        with self._handoff_lock:
+            table_rows = self._lake_rows.setdefault(lake_table, {})
+            existing = table_rows.get(row_id)
+            now = time.time()
+            lake_row = dict(row)
+            lake_row["_lake_row_id"] = row_id
+            lake_row["_lake_table"] = lake_table
+            lake_row["_source_batch_id"] = source_batch_id
+            lake_row["_source_row_id"] = source_row_id
+            lake_row["_receipt_id"] = receipt_id
+            lake_row["_commit_status"] = commit_status
+            lake_row["_updated_at"] = now
+            if existing is None:
+                lake_row["_created_at"] = now
+                lake_row["_revision"] = 1
+            else:
+                lake_row["_created_at"] = existing.get("_created_at", now)
+                lake_row["_revision"] = int(existing.get("_revision", 1)) + 1
+            table_rows[row_id] = lake_row
+            return copy.deepcopy(lake_row)
+
+    def list_lake_rows(
+        self, lake_table: str, *, include_internal: bool = False
+    ) -> list[dict[str, Any]]:
+        rows = list(self._lake_rows.get(lake_table, {}).values())
+        if include_internal:
+            return copy.deepcopy(rows)
+        return [
+            {k: copy.deepcopy(v) for k, v in row.items() if not k.startswith("_")}
+            for row in copy.deepcopy(rows)
+        ]
+
+    def get_lake_row(self, lake_table: str, row_id: str) -> dict[str, Any] | None:
+        row = self._lake_rows.get(lake_table, {}).get(row_id)
+        return copy.deepcopy(row) if row is not None else None
+
+    def confirm_batch_lake_rows(
+        self, lake_table: str, batch_id: str, receipt_id: str | None = None,
+        source_row_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> int:
+        """原批迟到回执到达后，把该批原始通过行标记为已对账确认。"""
+        allowed = set(source_row_ids) if source_row_ids is not None else None
+        count = 0
+        with self._handoff_lock:
+            for row in self._lake_rows.get(lake_table, {}).values():
+                if row.get("_source_batch_id") != batch_id:
+                    continue
+                if allowed is not None and row.get("_source_row_id") not in allowed:
+                    continue
+                row["_commit_status"] = "confirmed"
+                if receipt_id:
+                    row["_receipt_id"] = receipt_id
+                row["_reconciled_at"] = time.time()
+                count += 1
+        return count
+
+    def query_lake_rows(
+        self, lake_table: str, *, include_internal: bool = False
+    ) -> list[dict[str, Any]]:
+        return self.list_lake_rows(lake_table, include_internal=include_internal)
+
+    def list_ingested_rows(self, lake_table: str) -> list[dict[str, Any]]:
+        return self.list_lake_rows(lake_table)
+
+    def get_ingested_rows(self, lake_table: str) -> list[dict[str, Any]]:
+        return self.list_lake_rows(lake_table)
+
+    get_lake_rows = list_lake_rows
+
+    # ---- 质量检查/更正回执状态 ----
+
+    def save_quality_check(self, key: tuple[str, str], result: dict[str, Any]) -> None:
+        check_id = str(result.get("check_id") or f"qc-{uuid.uuid4().hex[:10]}")
+        result["check_id"] = check_id
+        with self._handoff_lock:
+            self._quality_checks[check_id] = result
+            self._quality_check_by_batch[key] = check_id
+
+    def get_quality_check(self, lake_table: str, batch_id: str) -> dict[str, Any] | None:
+        with self._handoff_lock:
+            check_id = self._quality_check_by_batch.get((lake_table, batch_id))
+            result = self._quality_checks.get(check_id) if check_id else None
+            return copy.deepcopy(result) if result is not None else None
+
+    def save_correction(
+        self, natural_key: str, correction: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """按自然幂等键保存更正；重发同一更正时返回首次记录。"""
+        with self._handoff_lock:
+            existing_id = self._correction_by_key.get(natural_key)
+            if existing_id is not None:
+                existing = self._corrections[existing_id]
+                return copy.deepcopy(existing), True
+            correction_id = str(
+                correction.get("correction_id")
+                or f"CORR-{hashlib.sha1(natural_key.encode()).hexdigest()[:16]}"
+            )
+            correction["correction_id"] = correction_id
+            correction.setdefault("status", "confirmed")
+            self._corrections[correction_id] = correction
+            self._correction_by_key[natural_key] = correction_id
+            receipt = correction.get("receipt")
+            if isinstance(receipt, dict) and receipt.get("receipt_id"):
+                self._receipts[str(receipt["receipt_id"])] = receipt
+            return copy.deepcopy(correction), False
+
+    def get_correction(self, correction_id: str) -> dict[str, Any] | None:
+        correction = self._corrections.get(correction_id)
+        return copy.deepcopy(correction) if correction is not None else None
+
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        receipt = self._receipts.get(receipt_id)
+        return copy.deepcopy(receipt) if receipt is not None else None
+
     # ---- 隔离区 ----
 
     def quarantine_rows(
         self, batch_id: str, rule_id: str, rule_name: str,
-        rows: list[dict[str, Any]]
+        rows: list[dict[str, Any]], lake_table: str | None = None,
     ) -> list[dict[str, Any]]:
-        """将被质量规则拦截的行放入隔离区。"""
+        """将被质量规则拦截的行放入隔离区。
+
+        同一批次、同一原始行、同一规则的重复隔离请求保持幂等；原始记录在
+        更正回炉后也不物理删除，方便后续回查和审计。
+        """
         quarantined = []
-        for row in rows:
-            qr = dict(row)
-            qr["_quarantine_batch"] = batch_id
-            qr["_quarantine_rule"] = rule_id
-            qr["_quarantine_rule_name"] = rule_name
-            qr["_quarantine_time"] = time.time()
-            quarantined.append(qr)
-        self._quarantine.setdefault(batch_id, []).extend(quarantined)
+        with self._handoff_lock:
+            bucket = self._quarantine.setdefault(batch_id, [])
+            existing_ids = {
+                qr.get("_quarantine_record_id")
+                for qr in bucket
+                if qr.get("_quarantine_rule") == rule_id
+            }
+            for index, row in enumerate(rows):
+                source_row_id = str(
+                    row.get("_source_row_id")
+                    or row.get("source_row_id")
+                    or row.get("row_ref")
+                    or (
+                        f"row-{index}-"
+                        + hashlib.sha1(
+                            json.dumps(row, sort_keys=True, ensure_ascii=False, default=str).encode()
+                        ).hexdigest()[:10]
+                    )
+                )
+                record_id = str(
+                    row.get("_quarantine_record_id")
+                    or row.get("quarantine_record_id")
+                    or f"QR-{lake_table or 'unknown_table'}-{batch_id}-{rule_id}-{source_row_id}"
+                )
+                if record_id in existing_ids:
+                    prior = next(
+                        (qr for qr in bucket
+                         if qr.get("_quarantine_record_id") == record_id),
+                        None,
+                    )
+                    if prior is not None:
+                        quarantined.append(copy.deepcopy(prior))
+                    continue
+
+                qr = {
+                    k: copy.deepcopy(v)
+                    for k, v in row.items()
+                    if not str(k).startswith("_source_")
+                }
+                qr["_quarantine_batch"] = batch_id
+                qr["_quarantine_table"] = lake_table or row.get("所属湖表", "")
+                qr["_quarantine_rule"] = rule_id
+                qr["_quarantine_rule_name"] = rule_name
+                qr["_quarantine_time"] = time.time()
+                qr["_quarantine_record_id"] = record_id
+                qr["_source_row_id"] = source_row_id
+                qr["_quarantine_status"] = "已隔离"
+                bucket.append(qr)
+                existing_ids.add(record_id)
+                quarantined.append(copy.deepcopy(qr))
         return quarantined
 
-    def list_quarantine(self, batch_id: str | None = None) -> list[dict[str, Any]]:
-        if batch_id is not None:
-            return list(self._quarantine.get(batch_id, []))
-        result: list[dict[str, Any]] = []
-        for rows in self._quarantine.values():
-            result.extend(rows)
-        return result
+    def list_quarantine(
+        self, batch_id: str | None = None, lake_table: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._handoff_lock:
+            if batch_id is not None:
+                result = list(self._quarantine.get(batch_id, []))
+            else:
+                result = []
+                for rows in self._quarantine.values():
+                    result.extend(rows)
+            if lake_table is not None:
+                result = [
+                    row for row in result
+                    if not row.get("_quarantine_table")
+                    or row.get("_quarantine_table") == lake_table
+                ]
+            return copy.deepcopy(result)
 
-    def release_quarantine(self, batch_id: str) -> list[dict[str, Any]]:
-        """回炉重入：从隔离区取出数据行。"""
-        rows = self._quarantine.pop(batch_id, [])
+    def get_quarantine_record(
+        self, record_id: str, lake_table: str | None = None
+    ) -> dict[str, Any] | None:
+        for row in self.list_quarantine(lake_table=lake_table):
+            if str(row.get("_quarantine_record_id")) == str(record_id):
+                return row
+            if str(row.get("id", "")) == str(record_id):
+                return row
+            if str(row.get("隔离编号", "")) == str(record_id):
+                return row
+        return None
+
+    def update_quarantine_record(
+        self, record_id: str, updates: dict[str, Any],
+        lake_table: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self._handoff_lock:
+            for rows in self._quarantine.values():
+                for row in rows:
+                    matches = (
+                        str(row.get("_quarantine_record_id")) == str(record_id)
+                        or str(row.get("id", "")) == str(record_id)
+                        or str(row.get("隔离编号", "")) == str(record_id)
+                    )
+                    table_ok = (
+                        lake_table is None
+                        or not row.get("_quarantine_table")
+                        or row.get("_quarantine_table") == lake_table
+                    )
+                    if matches and table_ok:
+                        row.update(updates)
+                        return copy.deepcopy(row)
+        return None
+
+    def release_quarantine(
+        self, batch_id: str, lake_table: str | None = None
+    ) -> list[dict[str, Any]]:
+        """回炉重入：复制隔离行作为待写入数据，但保留原始隔离记录。"""
+        rows = self.list_quarantine(batch_id, lake_table=lake_table)
+        with self._handoff_lock:
+            for qr in self._quarantine.get(batch_id, []):
+                if lake_table is None or qr.get("_quarantine_table") == lake_table:
+                    qr["_quarantine_status"] = "已回炉"
+                    qr["_released_at"] = time.time()
         cleaned: list[dict[str, Any]] = []
         for r in rows:
-            cleaned_row = {k: v for k, v in r.items() if not k.startswith("_quarantine_")}
+            cleaned_row = {k: v for k, v in r.items() if not k.startswith("_")}
             cleaned.append(cleaned_row)
         return cleaned
 

@@ -15,6 +15,8 @@
       </div>
     </header>
 
+    <QualityCheckPanel v-if="meta.key === 'quality_rule'" @submitted="reload" />
+
     <div class="stat-row">
       <article v-for="item in stats" :key="item.label" class="stat-card">
         <span class="stat-label">{{ item.label }}</span>
@@ -50,6 +52,14 @@
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
+            <RouterLink
+              v-if="meta.key === 'quarantine_zone'"
+              class="link detail-link"
+              :to="quarantineDetailHref(row)"
+              :data-testid="`quarantine-detail-${row.id}`"
+            >
+              隔离详情
+            </RouterLink>
             <button
               v-for="action in meta.actions"
               :key="action"
@@ -104,6 +114,7 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import QualityCheckPanel from '@/components/QualityCheckPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -148,6 +159,11 @@ function openCreate() {
   createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
+}
+
+function quarantineDetailHref(row: EntryRow) {
+  const lakeTable = encodeURIComponent(String(row['所属湖表'] || ''))
+  return `/quarantine_zone/${row.id}/detail?lake_table=${lakeTable}`
 }
 
 async function submitCreate() {

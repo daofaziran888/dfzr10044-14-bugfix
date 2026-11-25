@@ -29,10 +29,55 @@ export async function runAction(
   key: string,
   id: number,
   action: string,
+  values: Record<string, unknown> = {},
 ): Promise<ActionResult> {
   const response = await request(`/api/${key}/${id}/actions`, {
     method: 'POST',
-    body: JSON.stringify({ action }),
+    body: JSON.stringify({ action, values }),
+  })
+  return await response.json()
+}
+
+export async function qualityCheck(payload: Record<string, unknown>): Promise<any> {
+  const response = await request('/api/quality_rule/check', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+  return await response.json()
+}
+
+export async function getQuarantineDetail(
+  id: string | number,
+  lakeTable?: string,
+): Promise<any> {
+  const query = lakeTable ? `?lake_table=${encodeURIComponent(lakeTable)}` : ''
+  const response = await request(`/api/quarantine_zone/detail/${id}${query}`)
+  return await response.json()
+}
+
+export async function retryQuarantine(
+  id: string | number | null | undefined,
+  payload: Record<string, unknown>,
+): Promise<any> {
+  const pathId = id === null || id === undefined || id === '' ? 'retry' : `${id}/retry`
+  const response = await request(`/api/quarantine_zone/${pathId}`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+  return await response.json()
+}
+
+export async function queryLakeRows(lakeTable: string): Promise<any> {
+  const response = await request(
+    `/api/lake/query?lake_table=${encodeURIComponent(lakeTable)}`,
+  )
+  return await response.json()
+}
+
+export async function receiveBatchReceipt(payload: Record<string, unknown>): Promise<any> {
+  const response = await request('/api/ingest_batch/receipt', {
+    method: 'POST',
+    body: JSON.stringify(payload),
   })
   return await response.json()
 }
